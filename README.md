@@ -1,33 +1,26 @@
 # wayback-unified
 
-**Maximum-coverage Wayback Machine URL harvester** — a single unified tool that combines the best techniques from three leading open-source tools to extract the most possible archived URLs from the [Wayback Machine (archive.org)](https://web.archive.org/).
+A unified Wayback Machine URL harvester that combines three CDX query techniques to return the maximum number of unique archived URLs for any domain or subdomain.
 
 ---
 
-## What It Does
+## Features
 
-`wayback-unified` queries the Wayback Machine's CDX API using **three complementary strategies in parallel**, then merges and deduplicates everything into a clean, sorted list of unique URLs.
-
-### Techniques Combined
-
-| Source Tool | Technique Used |
-|---|---|
-| [waymore](https://github.com/xnl-h4ck3r/waymore) | Page-based CDX pagination with `showNumPages`, concurrent page fetching, MIME/status filters, date ranges, collapse |
-| [waybackurls](https://github.com/tomnomnom/waybackurls) | Wildcard subdomain query (`*.domain/*`), `collapse=urlkey`, JSON output, archived version fetching |
-| [waybackpy](https://github.com/akamhy/waybackpy) | Resume-key pagination (`showResumeKey` + `resumeKey`), field selection (`fl=original`), efficient large-set traversal |
-
-### How It Maximizes Results
-
-1. **Method 1 — Page-based pagination**: Queries total page count first, then fetches all pages concurrently using a thread pool.
-2. **Method 2 — Resume-key pagination**: Iterates through results using the CDX API's `resumeKey` cursor, capturing anything the page method may have missed.
-3. **Method 3 — Exact domain query**: A clean non-wildcard query using `collapse=urlkey` and JSON parsing for additional coverage.
-4. **Final deduplication**: All results are merged into a Python `set`, normalized (port stripping, trailing slashes), and sorted.
+- **Triple-method CDX querying** — runs page-based pagination, resume-key pagination, and an exact prefix query simultaneously, then merges all results
+- **Strict subdomain scope isolation** — when targeting a subdomain like `api.example.com`, results are filtered to that scope only — no leakage to the parent domain
+- **Concurrent page fetching** — fetches all CDX pages in parallel using a thread pool for speed
+- **Auto deduplication** — all results are merged, normalized, and deduplicated before output
+- **Date range filtering** — limit results to a specific time window
+- **Status code filtering** — only return URLs archived with a given HTTP status (e.g. `200`)
+- **MIME type filtering** — restrict by content type (e.g. `text/html`, `application/json`)
+- **Archived versions mode** — fetch all unique versions of a specific URL, deduped by content digest
+- **Pipeline-friendly** — results go to stdout, logs go to stderr, easy to pipe into other tools
+- **Auto rate limit handling** — detects 429/503 responses and retries with backoff
+- **No external dependencies** — uses Python standard library only
 
 ---
 
-## Installation
-
-### Option 1 — Run directly (no install needed)
+## Install
 
 ```bash
 git clone https://github.com/xhackingz/wayback-unified
@@ -35,162 +28,65 @@ cd wayback-unified
 python wayback_unified.py -d example.com
 ```
 
-### Option 2 — Install as a package
-
-```bash
-pip install .
-wayback-unified -d example.com
-```
-
-### Requirements
-
-- Python 3.7+
-- No external dependencies required (uses Python standard library only)
+**Requirements:** Python 3.7+
 
 ---
 
 ## Usage
 
 ```
-python wayback_unified.py -d <domain> [OPTIONS]
+python wayback_unified.py -d <target> [options]
 ```
 
-### Options
-
-| Flag | Description |
+| Option | Description |
 |---|---|
-| `-d`, `--domain` | Target domain (required), e.g. `example.com` |
-| `--subs` | Include subdomains (default: enabled) |
-| `--no-subs` | Exclude subdomains, only query the root domain |
-| `--from YYYYMMDD` | Start date filter, e.g. `20200101` |
-| `--to YYYYMMDD` | End date filter, e.g. `20231231` |
-| `--filter-status CODE` | Only return URLs with this HTTP status code |
-| `--filter-mime TYPE` | Only return URLs with this MIME type |
-| `-o`, `--output FILE` | Write results to a file instead of stdout |
-| `-t`, `--threads N` | Number of concurrent threads (default: 5) |
-| `--skip-resume-key` | Skip Method 2 — faster but slightly less coverage |
-| `--versions` | Fetch all unique archived versions of a specific URL |
-| `--version` | Show version and exit |
+| `-d`, `--domain` | Target domain or subdomain |
+| `--no-subs` | Exact hostname only, no subdomains |
+| `--from YYYYMMDD` | Start date |
+| `--to YYYYMMDD` | End date |
+| `--filter-status CODE` | Filter by HTTP status code |
+| `--filter-mime TYPE` | Filter by MIME type |
+| `-o FILE` | Save output to file |
+| `-t`, `--threads N` | Concurrent threads (default: 5) |
+| `--skip-resume-key` | Skip resume-key method (faster, slightly less coverage) |
+| `--versions` | Fetch all unique archived versions of a URL |
 
 ---
 
 ## Examples
 
-**Basic usage — collect all archived URLs for a domain:**
 ```bash
+# All URLs for a domain (subdomains included by default)
 python wayback_unified.py -d example.com
-```
 
-**Include subdomains (already on by default):**
-```bash
-python wayback_unified.py -d example.com --subs
-```
+# Scope to a specific subdomain only
+python wayback_unified.py -d api.example.com
 
-**Only the root domain, no subdomains:**
-```bash
+# Only the root domain, no subdomains
 python wayback_unified.py -d example.com --no-subs
-```
 
-**Filter by date range:**
-```bash
+# Filter by date range
 python wayback_unified.py -d example.com --from 20200101 --to 20231231
-```
 
-**Only return successfully archived pages (HTTP 200):**
-```bash
+# Only HTTP 200 responses
 python wayback_unified.py -d example.com --filter-status 200
-```
 
-**Only return HTML pages:**
-```bash
+# Only HTML pages
 python wayback_unified.py -d example.com --filter-mime text/html
-```
 
-**Combine filters:**
-```bash
-python wayback_unified.py -d example.com --filter-status 200 --filter-mime text/html --from 20210101
-```
-
-**Save results to a file:**
-```bash
+# Save to file
 python wayback_unified.py -d example.com -o results.txt
-```
 
-**Use more threads for faster page fetching:**
-```bash
-python wayback_unified.py -d example.com --threads 10 -o results.txt
-```
-
-**Pipe results into other tools:**
-```bash
+# Pipe into other tools
 python wayback_unified.py -d example.com | grep "\.js$"
-python wayback_unified.py -d example.com | grep "api"
 python wayback_unified.py -d example.com | httpx -silent
-```
 
-**Get all archived versions of a specific URL (unique by content digest):**
-```bash
+# Get all unique archived versions of a URL
 python wayback_unified.py --versions -d "https://example.com/login"
 ```
-
-**Fast mode (skip resume-key method):**
-```bash
-python wayback_unified.py -d example.com --skip-resume-key -o results.txt
-```
-
----
-
-## Output Format
-
-Results are printed to **stdout**, one URL per line. Log messages go to **stderr** so you can safely pipe output without mixing logs into results.
-
-```
-https://example.com/
-https://example.com/about
-https://example.com/api/v1/users
-https://sub.example.com/login
-...
-```
-
----
-
-## How the CDX API is Used
-
-All three methods query the [Wayback Machine CDX API](https://github.com/internetarchive/wayback/tree/master/wayback-cdx-server) (`https://web.archive.org/cdx/search/cdx`) with different parameter strategies:
-
-```
-# Method 1 — Page-based (waymore-style)
-/cdx/search/cdx?url=*.example.com/*&output=text&fl=original&collapse=urlkey&matchType=domain&page=N
-
-# Method 2 — Resume-key (waybackpy-style)
-/cdx/search/cdx?url=*.example.com/*&output=text&fl=original&collapse=urlkey&gzip=false&showResumeKey=true&limit=50000&resumeKey=...
-
-# Method 3 — Exact (waybackurls-style)
-/cdx/search/cdx?url=example.com/*&output=json&collapse=urlkey
-```
-
----
-
-## Rate Limiting
-
-The tool automatically handles rate limiting:
-- Detects `429 Too Many Requests` and backs off with exponential wait
-- Detects `503 Service Unavailable` and retries
-- Up to 3 retries per request by default
-
-To be respectful to the Wayback Machine, avoid running with very high thread counts (stay at 5–10).
 
 ---
 
 ## License
 
 [MIT](LICENSE)
-
----
-
-## Credits
-
-This tool is a synthesis of techniques from:
-- [waymore](https://github.com/xnl-h4ck3r/waymore) by [@xnl-h4ck3r](https://github.com/xnl-h4ck3r)
-- [waybackurls](https://github.com/tomnomnom/waybackurls) by [@tomnomnom](https://github.com/tomnomnom)
-- [waybackpy](https://github.com/akamhy/waybackpy) by [@akamhy](https://github.com/akamhy)
