@@ -13,7 +13,6 @@ A unified Wayback Machine URL harvester that combines three CDX query techniques
 - **Date range filtering** — limit results to a specific time window
 - **Status code filtering** — only return URLs archived with a given HTTP status (e.g. `200`)
 - **MIME type filtering** — restrict by content type (e.g. `text/html`, `application/json`)
-- **Archived versions mode** — fetch all unique versions of a specific URL, deduped by content digest
 - **Pipeline-friendly** — results go to stdout, logs go to stderr, easy to pipe into other tools
 - **Auto rate limit handling** — detects 429/503 responses and retries with backoff
 - **No external dependencies** — uses Python standard library only
@@ -49,7 +48,6 @@ python wayback_unified.py -d <target> [options]
 | `-o FILE` | Save output to file |
 | `-t`, `--threads N` | Concurrent threads (default: 5) |
 | `--skip-resume-key` | Skip resume-key method (faster, slightly less coverage) |
-| `--versions` | Fetch all unique archived versions of a URL |
 
 ---
 
@@ -80,9 +78,6 @@ python wayback_unified.py -d example.com -o results.txt
 # Pipe into other tools
 python wayback_unified.py -d example.com | grep "\.js$"
 python wayback_unified.py -d example.com | httpx -silent
-
-# Get all unique archived versions of a URL
-python wayback_unified.py --versions -d "https://example.com/login"
 ```
 
 ---
