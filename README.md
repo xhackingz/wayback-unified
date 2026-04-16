@@ -29,6 +29,14 @@ python wayback_unified.py -d example.com
 
 **Requirements:** Python 3.7+
 
+### Keeping up to date
+
+If you already cloned the repo and want the latest version, just run inside the folder:
+
+```bash
+git pull
+```
+
 ---
 
 ## Usage
