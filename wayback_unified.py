@@ -19,6 +19,7 @@ import argparse
 import sys
 import time
 import threading
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, urlencode
 import urllib.request
@@ -32,10 +33,160 @@ DEFAULT_THREADS = 5
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
-# Lock so concurrent page threads don't interleave their stderr log lines
+# ---------------------------------------------------------------------------
+# Terminal colors and TTY detection
+# ---------------------------------------------------------------------------
+
+_IS_TTY = sys.stderr.isatty()
+
+
+class _C:
+    """ANSI color codes. Empty strings when not a TTY so pipes stay clean."""
+    RESET  = "\033[0m"   if _IS_TTY else ""
+    BOLD   = "\033[1m"   if _IS_TTY else ""
+    DIM    = "\033[2m"   if _IS_TTY else ""
+    CYAN   = "\033[36m"  if _IS_TTY else ""
+    BCYAN  = "\033[96m"  if _IS_TTY else ""
+    GREEN  = "\033[32m"  if _IS_TTY else ""
+    BGREEN = "\033[92m"  if _IS_TTY else ""
+    YELLOW = "\033[33m"  if _IS_TTY else ""
+    RED    = "\033[31m"  if _IS_TTY else ""
+    WHITE  = "\033[97m"  if _IS_TTY else ""
+
+
+def _ansi_len(s: str) -> int:
+    """Return the visible (non-ANSI) length of a string."""
+    return len(re.sub(r'\033\[[0-9;]*m', '', s))
+
+
+# Lock so concurrent threads don't interleave stderr writes
 _log_lock = threading.Lock()
+
+_BOX_DASHES = 52  # number of ─ chars between ╭ and ╮
+
+
+def _box_row(text: str) -> str:
+    """Format a banner row, padding to box width accounting for ANSI codes."""
+    visible = _ansi_len(text)
+    pad = _BOX_DASHES - 2 - visible  # 2 = leading+trailing space inside box
+    return f"{_C.CYAN}│{_C.RESET} {text}{' ' * max(0, pad)} {_C.CYAN}│{_C.RESET}"
+
+
+def _box_blank() -> str:
+    return f"{_C.CYAN}│{' ' * _BOX_DASHES}│{_C.RESET}"
+
+
+def _print_banner() -> None:
+    top  = f"{_C.CYAN}╭{'─' * _BOX_DASHES}╮{_C.RESET}"
+    bot  = f"{_C.CYAN}╰{'─' * _BOX_DASHES}╯{_C.RESET}"
+
+    name = f"{_C.BOLD}{_C.BCYAN}wayback-unified{_C.RESET}  {_C.DIM}v{VERSION}{_C.RESET}"
+    tag  = f"{_C.DIM}Maximum Wayback Machine URL harvester{_C.RESET}"
+    cred = f"{_C.DIM}by @xhacking_z{_C.RESET}"
+
+    with _log_lock:
+        for row in [
+            "",
+            top,
+            _box_blank(),
+            _box_row(name),
+            _box_row(tag),
+            _box_row(cred),
+            _box_blank(),
+            bot,
+            "",
+        ]:
+            sys.stderr.write(row + "\n")
+        sys.stderr.flush()
+
+
+def _colorize(msg: str) -> str:
+    """Apply color to log messages based on their prefix tag."""
+    if not _IS_TTY:
+        return msg
+    if msg.startswith("[WARN]"):
+        return f"{_C.YELLOW}{_C.BOLD}{msg}{_C.RESET}"
+    if msg.startswith("[METHOD"):
+        return f"{_C.BOLD}{_C.BCYAN}{msg}{_C.RESET}"
+    if msg.startswith("[DONE]"):
+        return f"{_C.BOLD}{_C.BGREEN}{msg}{_C.RESET}"
+    if msg.startswith("[SCOPE]"):
+        return f"{_C.YELLOW}{msg}{_C.RESET}"
+    if msg.startswith("[INFO]"):
+        return f"{_C.DIM}{msg}{_C.RESET}"
+    return msg
+
+
+def _log(msg: str) -> None:
+    """
+    Write a log message to stderr — thread-safe.
+    Clears the spinner line first (via \\r\\033[K) so the spinner never
+    overwrites a log message.
+    """
+    colored = _colorize(msg)
+    with _log_lock:
+        if _IS_TTY:
+            sys.stderr.write("\r\033[K")
+        print(colored, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Live spinner
+# ---------------------------------------------------------------------------
+
+class Spinner:
+    """
+    Braille spinner that runs in a background daemon thread.
+    Writes to stderr using \\r so it stays on one line and is cleared by _log().
+    Safely disabled when stderr is not a TTY (e.g. redirected or piped).
+    """
+
+    _FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def __init__(self) -> None:
+        self._msg = ""
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def start(self, msg: str = "") -> "Spinner":
+        if not _IS_TTY:
+            return self
+        self._msg = msg
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def update(self, msg: str) -> None:
+        """Change the spinner message while it is running."""
+        self._msg = msg
+
+    def stop(self) -> None:
+        if not _IS_TTY:
+            return
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=0.5)
+        with _log_lock:
+            sys.stderr.write("\r\033[K")
+            sys.stderr.flush()
+
+    def _run(self) -> None:
+        i = 0
+        while not self._stop.is_set():
+            # Non-blocking acquire: skip this frame if _log() holds the lock
+            if _log_lock.acquire(blocking=False):
+                try:
+                    frame = self._FRAMES[i % len(self._FRAMES)]
+                    line = f"\r{_C.CYAN}{frame}{_C.RESET} {_C.DIM}{self._msg}{_C.RESET}"
+                    sys.stderr.write(line)
+                    sys.stderr.flush()
+                finally:
+                    _log_lock.release()
+            time.sleep(0.08)
+            i += 1
 
 
 # ---------------------------------------------------------------------------
@@ -104,11 +255,6 @@ def is_subdomain_target(domain: str) -> bool:
     """
     Return True if `domain` is itself a subdomain (e.g. api.example.com),
     False if it is a root/eTLD+1 domain (e.g. example.com).
-
-    A root domain has exactly one dot separating label from public suffix.
-    We use a simple heuristic: split by '.' and count labels.
-    Two labels  -> root domain   (example.com)
-    Three+      -> subdomain     (api.example.com, sub.api.example.com)
     """
     parts = domain.lower().strip().split(".")
     return len(parts) > 2
@@ -116,20 +262,8 @@ def is_subdomain_target(domain: str) -> bool:
 
 def filter_by_scope(urls: set, target: str, include_subs: bool) -> set:
     """
-    Strict hostname-level post-filter — applied after every CDX fetch to
-    guarantee that CDX scope leakage (SURT key expansion) never pollutes output.
-
-    Rules:
-      include_subs=True  -> keep URLs where hostname == target
-                            OR hostname ends with ".<target>"
-                            (i.e. direct subdomains of target only)
-      include_subs=False -> keep URLs where hostname == target exactly
-
-    This means:
-      target=api.example.com, include_subs=True  -> api.example.com + *.api.example.com
-      target=api.example.com, include_subs=False -> api.example.com only
-      target=example.com,     include_subs=True  -> example.com + *.example.com
-      target=example.com,     include_subs=False -> example.com only
+    Strict hostname-level post-filter. Applied after every CDX fetch to
+    guarantee that SURT key expansion never leaks out-of-scope URLs.
     """
     target_lower = target.lower().strip()
     sub_suffix = f".{target_lower}"
@@ -153,48 +287,24 @@ def filter_by_scope(urls: set, target: str, include_subs: bool) -> set:
 
 
 # ---------------------------------------------------------------------------
-# CDX query builders — correct matchType per target type
+# CDX query builders
 # ---------------------------------------------------------------------------
 
 def _cdx_params_for_target(domain: str, include_subs: bool) -> dict:
     """
-    Build the correct CDX `url` + `matchType` parameters for a given target.
-
-    The CDX API's `matchType=domain` is designed for root domains and can
-    produce SURT key collisions when applied to subdomains, causing scope
-    leakage back to the parent domain.
-
-    Safe strategy:
-      - Root domain  + include_subs  -> url=*.domain/*,       matchType=domain
-      - Root domain  + no subs       -> url=domain/*,         matchType=prefix
-      - Subdomain    + include_subs  -> url=*.subdomain/*,    matchType=prefix
-                                        (no matchType=domain — avoids leakage)
-      - Subdomain    + no subs       -> url=subdomain/*,      matchType=prefix
-
-    The post-filter in filter_by_scope() is the final guarantee regardless.
+    Build correct CDX `url` + `matchType` parameters.
+    Uses matchType=prefix for subdomain targets to avoid SURT key leakage.
     """
     is_sub = is_subdomain_target(domain)
 
     if not is_sub and include_subs:
-        return {
-            "url": f"*.{domain}/*",
-            "matchType": "domain",
-        }
+        return {"url": f"*.{domain}/*", "matchType": "domain"}
     elif not is_sub and not include_subs:
-        return {
-            "url": f"{domain}/*",
-            "matchType": "prefix",
-        }
+        return {"url": f"{domain}/*", "matchType": "prefix"}
     elif is_sub and include_subs:
-        return {
-            "url": f"*.{domain}/*",
-            "matchType": "prefix",
-        }
-    else:  # is_sub and not include_subs
-        return {
-            "url": f"{domain}/*",
-            "matchType": "prefix",
-        }
+        return {"url": f"*.{domain}/*", "matchType": "prefix"}
+    else:
+        return {"url": f"{domain}/*", "matchType": "prefix"}
 
 
 # ---------------------------------------------------------------------------
@@ -202,10 +312,7 @@ def _cdx_params_for_target(domain: str, include_subs: bool) -> dict:
 # ---------------------------------------------------------------------------
 
 def get_total_pages(params: dict) -> int:
-    """
-    Technique from waymore: query showNumPages=true to get total page count
-    before spawning concurrent page fetches.
-    """
+    """Query showNumPages=true to get total CDX page count (waymore technique)."""
     check_params = dict(params)
     check_params["showNumPages"] = "true"
     check_params.pop("page", None)
@@ -224,9 +331,8 @@ def get_total_pages(params: dict) -> int:
 
 def fetch_page(params: dict, page: int, on_batch=None) -> set:
     """
-    Fetch a single CDX page and return a set of URLs.
-    If on_batch is provided, call it immediately with the parsed results
-    so the caller can stream URLs as soon as this page finishes.
+    Fetch a single CDX page. Calls on_batch immediately when parsed so
+    results can stream to the caller without waiting for all pages.
     """
     page_params = dict(params)
     page_params["page"] = str(page)
@@ -241,9 +347,8 @@ def fetch_page(params: dict, page: int, on_batch=None) -> set:
 def fetch_with_resume_key(params: dict, limit: int = DEFAULT_LIMIT,
                           on_batch=None) -> set:
     """
-    Technique from waybackpy: use showResumeKey + resumeKey cursor for
-    paginated fetching. More reliable than page-based for very large sets.
-    on_batch is called after each cursor page so results stream immediately.
+    Resume-key cursor pagination (waybackpy technique).
+    Calls on_batch after each cursor page for real-time streaming.
     """
     results = set()
     resume_key = None
@@ -296,10 +401,7 @@ def fetch_with_resume_key(params: dict, limit: int = DEFAULT_LIMIT,
 # ---------------------------------------------------------------------------
 
 def parse_cdx_response(response: str) -> set:
-    """
-    Parse a CDX API response into a set of original URLs.
-    Handles both plain text (one URL per line) and JSON array formats.
-    """
+    """Parse CDX API response into a set of original URLs."""
     urls = set()
     if not response or not response.strip():
         return urls
@@ -336,10 +438,7 @@ def parse_cdx_response(response: str) -> set:
 
 
 def normalize_url(url: str) -> str:
-    """
-    Normalize a URL: remove default ports (80/443), clean whitespace.
-    Technique from waymore's linksFoundAdd().
-    """
+    """Normalize a URL: remove default ports (80/443), clean whitespace."""
     try:
         parsed = urlparse(url.strip())
         netloc = parsed.netloc
@@ -351,7 +450,7 @@ def normalize_url(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Three fetch methods (waymore / waybackurls / waybackpy techniques)
+# Three fetch methods
 # ---------------------------------------------------------------------------
 
 def get_wayback_urls_pagination(
@@ -362,13 +461,9 @@ def get_wayback_urls_pagination(
     to_date: str = None,
     threads: int = DEFAULT_THREADS,
     on_batch=None,
+    spinner: Spinner = None,
 ) -> set:
-    """
-    Method 1 — Page-based concurrent pagination (waymore technique).
-    Fetches total page count first, then requests all pages in parallel.
-    on_batch is called from each worker thread as pages complete, enabling
-    real-time streaming without waiting for the full method to finish.
-    """
+    """Method 1 — Page-based concurrent pagination (waymore technique)."""
     base = _cdx_params_for_target(domain, include_subs)
     params = {
         **base,
@@ -385,12 +480,16 @@ def get_wayback_urls_pagination(
         for i, f in enumerate(filters):
             params[f"filter{i}"] = f
 
+    if spinner:
+        spinner.update("Querying CDX page count...")
     total_pages = get_total_pages(params)
     _log(f"[INFO] CDX page-based: {total_pages} page(s) to fetch")
 
     results = set()
 
     if total_pages == 1:
+        if spinner:
+            spinner.update("Fetching single page...")
         url = build_cdx_url(params)
         page_results = parse_cdx_response(make_request(url))
         results.update(page_results)
@@ -398,6 +497,9 @@ def get_wayback_urls_pagination(
             on_batch(page_results)
         _log(f"[INFO] Page-based (single request): {len(results)} raw URLs")
         return results
+
+    if spinner:
+        spinner.update(f"Fetching {total_pages} pages concurrently...")
 
     with ThreadPoolExecutor(max_workers=threads) as executor:
         futures = {
@@ -426,12 +528,9 @@ def get_wayback_urls_resumekey(
     from_date: str = None,
     to_date: str = None,
     on_batch=None,
+    spinner: Spinner = None,
 ) -> set:
-    """
-    Method 2 — Resume-key cursor pagination (waybackpy technique).
-    Catches entries that page-based pagination may miss on large datasets.
-    on_batch is called after each cursor page for real-time streaming.
-    """
+    """Method 2 — Resume-key cursor pagination (waybackpy technique)."""
     base = _cdx_params_for_target(domain, include_subs)
     params = {
         **base,
@@ -450,6 +549,8 @@ def get_wayback_urls_resumekey(
             params[f"filter{i}"] = f
 
     _log("[INFO] CDX resume-key pagination starting...")
+    if spinner:
+        spinner.update("Resume-key pagination running...")
     return fetch_with_resume_key(params, on_batch=on_batch)
 
 
@@ -459,12 +560,9 @@ def get_wayback_urls_exact(
     from_date: str = None,
     to_date: str = None,
     on_batch=None,
+    spinner: Spinner = None,
 ) -> set:
-    """
-    Method 3 — Exact domain prefix query with JSON output (waybackurls technique).
-    Uses collapse=urlkey and JSON parsing for additional coverage.
-    on_batch is called once when the response is parsed.
-    """
+    """Method 3 — Exact prefix query with JSON output (waybackurls technique)."""
     params = {
         "url": f"{domain}/*",
         "output": "json",
@@ -477,6 +575,8 @@ def get_wayback_urls_exact(
         params["to"] = to_date
 
     _log("[INFO] CDX exact prefix query (waybackurls technique)...")
+    if spinner:
+        spinner.update("Running exact prefix query...")
     response = make_request(build_cdx_url(params))
 
     results = set()
@@ -523,12 +623,6 @@ def deduplicate(urls: set) -> list:
     return sorted(normalized)
 
 
-def _log(msg: str) -> None:
-    """Write log messages to stderr — thread-safe, clean line output."""
-    with _log_lock:
-        print(msg, file=sys.stderr, flush=True)
-
-
 # ---------------------------------------------------------------------------
 # Main harvest orchestrator
 # ---------------------------------------------------------------------------
@@ -545,40 +639,23 @@ def harvest(
     stream: bool = False,
 ) -> list:
     """
-    Harvest archived URLs using all three complementary CDX methods, then
-    apply strict scope enforcement and deduplicate.
+    Harvest archived URLs using all three CDX methods with streaming output.
 
-    When stream=True, URLs are printed to stdout as they are discovered —
-    per page, per resume-key batch, and per method — rather than buffered
-    until the end.  Results are still deduplicated globally so no URL
-    appears twice in the output regardless of which method found it.
-
-    Strategy:
-      1. Page-based concurrent pagination          (waymore)
-      2. Resume-key cursor pagination              (waybackpy)
-      3. Exact prefix query with JSON output       (waybackurls)
-      4. Inline scope filter + dedup on every batch (streaming)
-      5. Final sorted list returned (for -o file output)
+    When stream=True, every new in-scope URL is printed to stdout immediately
+    as it is discovered — per page, per resume-key batch, and per method.
+    Thread-safe deduplication ensures no URL appears twice regardless of
+    which method or thread found it.
     """
     filters = build_filters(filter_status, filter_mime)
     is_sub = is_subdomain_target(domain)
 
-    # Shared state across all methods and threads
-    accepted_urls: set = set()       # in-scope, deduplicated
-    emit_lock = threading.Lock()     # protects accepted_urls + stdout writes
-    scope_filtered = [0]             # count of out-of-scope URLs removed
+    accepted_urls: set = set()
+    emit_lock = threading.Lock()
+    scope_filtered = [0]
 
     def on_batch(raw_urls: set) -> None:
-        """
-        Called by every fetch method/page/batch as soon as results arrive.
-        1. Applies scope filter inline (no CDX leakage reaches output).
-        2. Deduplicates globally across all methods and threads.
-        3. In stream mode: prints each new URL to stdout immediately.
-        Thread-safe via emit_lock.
-        """
         scoped = filter_by_scope(raw_urls, domain, include_subs)
         rejected = len(raw_urls) - len(scoped)
-
         with emit_lock:
             scope_filtered[0] += rejected
             for url in scoped:
@@ -588,8 +665,7 @@ def harvest(
                     if stream:
                         print(normalized, flush=True)
 
-    _log(f"\n[wayback-unified v{VERSION}]")
-    _log(f"[INFO] Target        : {domain}")
+    _log(f"[INFO] Target        : {_C.BOLD}{domain}{_C.RESET}")
     _log(f"[INFO] Is subdomain  : {is_sub}")
     _log(f"[INFO] Include subs  : {include_subs}")
     if from_date:
@@ -600,11 +676,14 @@ def harvest(
         _log(f"[INFO] CDX filters   : {filters}")
     _log(f"[INFO] Threads       : {threads}")
     if stream:
-        _log(f"[INFO] Mode          : streaming (results print as found)")
+        _log(f"[INFO] Mode          : {_C.CYAN}streaming{_C.RESET} (results print as found)")
     _log("")
 
+    spinner = Spinner()
+    spinner.start("Initializing...")
+
     # --- Method 1 -----------------------------------------------------------
-    _log("[METHOD 1/3] Page-based concurrent pagination (waymore technique)...")
+    _log(f"[METHOD 1/3] Page-based concurrent pagination (waymore technique)...")
     try:
         page_urls = get_wayback_urls_pagination(
             domain,
@@ -614,6 +693,7 @@ def harvest(
             to_date=to_date,
             threads=threads,
             on_batch=on_batch,
+            spinner=spinner,
         )
         _log(f"[METHOD 1/3] Raw results: {len(page_urls)} URLs\n")
     except Exception as e:
@@ -631,6 +711,7 @@ def harvest(
                 from_date=from_date,
                 to_date=to_date,
                 on_batch=on_batch,
+                spinner=spinner,
             )
             new_count = len(accepted_urls) - before
             _log(
@@ -650,6 +731,7 @@ def harvest(
             from_date=from_date,
             to_date=to_date,
             on_batch=on_batch,
+            spinner=spinner,
         )
         new_count = len(accepted_urls) - before
         _log(
@@ -659,6 +741,8 @@ def harvest(
     except Exception as e:
         _log(f"[WARN] Method 3 failed: {e}\n")
 
+    spinner.stop()
+
     if scope_filtered[0] > 0:
         _log(
             f"[SCOPE] Removed {scope_filtered[0]} out-of-scope URLs "
@@ -666,7 +750,7 @@ def harvest(
         )
 
     final = sorted(accepted_urls)
-    _log(f"[DONE] Total unique in-scope URLs: {len(final)}")
+    _log(f"[DONE] Total unique in-scope URLs: {_C.BOLD}{len(final)}{_C.RESET}")
     return final
 
 
@@ -772,10 +856,9 @@ Examples:
 
     args = parser.parse_args()
     include_subs = not args.no_subs
-
-    # Stream to stdout in real-time when no output file is specified.
-    # When -o is used, collect everything first then write sorted to the file.
     stream = args.output is None
+
+    _print_banner()
 
     final = harvest(
         domain=args.domain,
@@ -792,7 +875,7 @@ Examples:
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
             f.write("\n".join(final) + "\n")
-        _log(f"[INFO] Results written to: {args.output}")
+        _log(f"[INFO] Results written to: {_C.BOLD}{args.output}{_C.RESET}")
 
 
 if __name__ == "__main__":
