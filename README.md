@@ -1,22 +1,30 @@
 # wayback-unified
 
-  A precise Wayback Machine URL harvester built around one core idea: **target exactly what you want — a specific subdomain or a full domain — and get every archived URL for it, no leakage, no noise.**
+  A Wayback Machine URL harvester focused on one thing: **targeting exactly the subdomain or domain you specify — and only that.**
 
   ---
 
-  ## The main feature
+  ## What problem this solves
 
-  Most Wayback tools return URLs for the entire root domain even when you only asked for a subdomain. wayback-unified scopes results strictly to whatever you target:
+  Tools like **waymore**, **waybackurls**, and **waybackpy** are each powerful on their own, but combining their techniques introduces a scope problem — when you ask for `api.example.com`, you often get results for `example.com`, unrelated subdomains, or parent domains leaking through the CDX index.
 
-  - `-d api.example.com` → only `api.example.com` (and its sub-subdomains if `--no-subs` is not set)
+  wayback-unified fixes that. It uses a single, strict CDX query and filters every result at the hostname level before output, so what you ask for is exactly what you get.
+
+  ---
+
+  ## Main feature: precise scope targeting
+
+  - `-d api.example.com` → only `api.example.com` (plus its sub-subdomains unless `--no-subs`)
   - `-d example.com` → the full domain and all subdomains
   - `-d example.com --no-subs` → the root domain only, nothing else
+
+  No bleed, no leakage, no unexpected results from other hosts.
 
   ---
 
   ## How it works
 
-  All URLs come from a single source — the Wayback CDX API:
+  Single data source — the Wayback CDX API:
 
   ```
   https://web.archive.org/cdx/search/cdx?url=*.TARGET&fl=original&collapse=urlkey
@@ -24,11 +32,12 @@
 
   The pipeline:
 
-  1. Connects to the CDX API with resume-key cursor pagination
-  2. Streams the response in chunks — the full body is never loaded into memory
-  3. Iterates cursor pages until the API signals completion (safe for any result size)
-  4. Scope-filters, normalizes, and deduplicates results as they arrive
-  5. Prints to stdout as URLs are found (or writes to a file with `-o`)
+  1. Connects to the CDX endpoint with resume-key cursor pagination
+  2. Streams the response in 64 KB chunks — the full body is never loaded into memory
+  3. Iterates cursor pages until the API signals completion (safe for any dataset size)
+  4. Applies strict hostname-level scope filtering on every URL before accepting it
+  5. Deduplicates and normalizes results as they arrive
+  6. Prints to stdout as URLs are found, or writes to a file with `-o`
 
   No external dependencies — Python standard library only.
 
@@ -61,11 +70,11 @@
   | Option | Description |
   |---|---|
   | `-d`, `--domain` | Target domain or subdomain |
-  | `--no-subs` | Exact hostname only, no subdomains |
+  | `--no-subs` | Exact hostname only — no subdomains |
   | `--from YYYYMMDD` | Start date filter |
   | `--to YYYYMMDD` | End date filter |
-  | `--filter-status CODE` | Filter by archived HTTP status code |
-  | `--filter-mime TYPE` | Filter by MIME type |
+  | `--filter-status CODE` | Filter by archived HTTP status code (e.g. `200`) |
+  | `--filter-mime TYPE` | Filter by MIME type (e.g. `text/html`) |
   | `-o FILE` | Write results to a file instead of stdout |
 
   ---
@@ -73,19 +82,19 @@
   ## Examples
 
   ```bash
-  # All URLs for a domain (subdomains included)
+  # All URLs for a domain (subdomains included by default)
   python wayback_unified.py -d example.com
 
   # Specific subdomain only
   python wayback_unified.py -d api.example.com
 
-  # Root domain only, no subdomains
+  # Root domain, no subdomains
   python wayback_unified.py -d example.com --no-subs
 
   # Date range
   python wayback_unified.py -d example.com --from 20200101 --to 20231231
 
-  # HTTP 200 responses only
+  # HTTP 200 only
   python wayback_unified.py -d example.com --filter-status 200
 
   # HTML pages only
