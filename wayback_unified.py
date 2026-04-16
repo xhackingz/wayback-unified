@@ -4,7 +4,7 @@ wayback-unified — A high-coverage Wayback Machine URL harvester.
 
 Combines techniques from:
   - waymore   (xnl-h4ck3r)     : pagination, filters, collapse, matchType, resumeKey
-  - waybackurls (tomnomnom)     : wildcard subdomains, urlkey collapse, versions
+  - waybackurls (tomnomnom)     : wildcard subdomains, urlkey collapse, JSON output
   - waybackpy  (akamhy)         : resumeKey pagination, CDX field selection, date ranges
 
 Usage:
@@ -477,44 +477,6 @@ def get_wayback_urls_exact(
 
 
 # ---------------------------------------------------------------------------
-# Versions mode (waybackurls --get-versions technique)
-# ---------------------------------------------------------------------------
-
-def get_wayback_versions(url_input: str) -> set:
-    """
-    Fetch all unique archived versions of a specific URL.
-    Deduplicates by content digest so identical captures are collapsed.
-    """
-    params = {"url": url_input, "output": "json"}
-    _log(f"[INFO] Fetching all archived versions of: {url_input}")
-    response = make_request(build_cdx_url(params))
-
-    versions = set()
-    if not response or not response.strip():
-        return versions
-
-    try:
-        data = json.loads(response.strip())
-        seen_digests: set = set()
-        skip_first = True
-        for row in data:
-            if skip_first:
-                skip_first = False
-                continue
-            if isinstance(row, list) and len(row) >= 7:
-                timestamp, original, digest = row[1], row[2], row[5]
-                if digest not in seen_digests:
-                    seen_digests.add(digest)
-                    versions.add(
-                        f"https://web.archive.org/web/{timestamp}if_/{original}"
-                    )
-    except (json.JSONDecodeError, TypeError):
-        pass
-
-    return versions
-
-
-# ---------------------------------------------------------------------------
 # Misc helpers
 # ---------------------------------------------------------------------------
 
@@ -692,9 +654,6 @@ Examples:
   # Pipe into other tools
   python wayback_unified.py -d example.com | grep '\\.js$'
   python wayback_unified.py -d example.com | httpx -silent
-
-  # Get all unique archived versions of a URL (deduped by content digest)
-  python wayback_unified.py --versions -d "https://example.com/login"
         """,
     )
 
@@ -756,14 +715,6 @@ Examples:
         help="Skip Method 2 (resume-key) — faster but slightly less coverage",
     )
     parser.add_argument(
-        "--versions",
-        action="store_true",
-        help=(
-            "Fetch all unique archived versions of a specific URL. "
-            "Pass the full URL via -d."
-        ),
-    )
-    parser.add_argument(
         "--version",
         action="version",
         version=f"wayback-unified {VERSION}",
@@ -772,21 +723,16 @@ Examples:
     args = parser.parse_args()
     include_subs = not args.no_subs
 
-    if args.versions:
-        versions = get_wayback_versions(args.domain)
-        final = sorted(versions)
-        _log(f"[DONE] Total unique versions: {len(final)}")
-    else:
-        final = harvest(
-            domain=args.domain,
-            include_subs=include_subs,
-            from_date=args.from_date,
-            to_date=args.to_date,
-            filter_status=args.filter_status,
-            filter_mime=args.filter_mime,
-            threads=args.threads,
-            skip_resume_key=args.skip_resume_key,
-        )
+    final = harvest(
+        domain=args.domain,
+        include_subs=include_subs,
+        from_date=args.from_date,
+        to_date=args.to_date,
+        filter_status=args.filter_status,
+        filter_mime=args.filter_mime,
+        threads=args.threads,
+        skip_resume_key=args.skip_resume_key,
+    )
 
     output_text = "\n".join(final)
 
