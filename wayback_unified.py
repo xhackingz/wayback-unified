@@ -9,7 +9,7 @@ Combines techniques from:
 
 Usage:
   python wayback_unified.py -d example.com
-  python wayback_unified.py -d example.com --subs --threads 10
+  python wayback_unified.py -d api.example.com --subs
   python wayback_unified.py -d example.com --from 20200101 --to 20231231
   python wayback_unified.py -d example.com --filter-status 200 --filter-mime text/html
   python wayback_unified.py -d example.com -o results.txt
@@ -19,11 +19,10 @@ import argparse
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 import urllib.request
 import urllib.error
 import json
-import re
 
 
 CDX_ENDPOINT = "https://web.archive.org/cdx/search/cdx"
@@ -32,16 +31,23 @@ DEFAULT_THREADS = 5
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
 
 def make_request(url: str, retries: int = MAX_RETRIES) -> str:
     """
-    Perform an HTTP GET request with retry logic.
+    Perform an HTTP GET request with retry/back-off logic.
     Returns the response body as text, or empty string on failure.
     """
     headers = {
-        "User-Agent": f"wayback-unified/{VERSION} (https://github.com/xhackingz/wayback-unified)"
+        "User-Agent": (
+            f"wayback-unified/{VERSION} "
+            "(https://github.com/xhackingz/wayback-unified)"
+        )
     }
     for attempt in range(1, retries + 1):
         try:
@@ -51,19 +57,28 @@ def make_request(url: str, retries: int = MAX_RETRIES) -> str:
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 wait = RETRY_DELAY * attempt * 2
-                _log(f"[WARN] Rate limited (429). Waiting {wait}s before retry {attempt}/{retries}...")
+                _log(
+                    f"[WARN] Rate limited (429). "
+                    f"Waiting {wait}s before retry {attempt}/{retries}..."
+                )
                 time.sleep(wait)
             elif e.code == 503:
                 wait = RETRY_DELAY * attempt
-                _log(f"[WARN] Service unavailable (503). Waiting {wait}s before retry {attempt}/{retries}...")
+                _log(
+                    f"[WARN] Service unavailable (503). "
+                    f"Waiting {wait}s before retry {attempt}/{retries}..."
+                )
                 time.sleep(wait)
             else:
-                _log(f"[WARN] HTTP {e.code} for URL: {url}")
+                _log(f"[WARN] HTTP {e.code} for: {url}")
                 if attempt == retries:
                     return ""
         except urllib.error.URLError as e:
             wait = RETRY_DELAY * attempt
-            _log(f"[WARN] URL error: {e.reason}. Waiting {wait}s before retry {attempt}/{retries}...")
+            _log(
+                f"[WARN] URL error: {e.reason}. "
+                f"Waiting {wait}s before retry {attempt}/{retries}..."
+            )
             time.sleep(wait)
         except Exception as e:
             _log(f"[WARN] Request failed: {e}")
@@ -72,14 +87,118 @@ def make_request(url: str, retries: int = MAX_RETRIES) -> str:
     return ""
 
 
-def build_cdx_url(target: str, params: dict) -> str:
-    """Build a CDX API URL with the given parameters."""
-    from urllib.parse import urlencode
-    query = urlencode(params)
-    return f"{CDX_ENDPOINT}?{query}"
+def build_cdx_url(params: dict) -> str:
+    """Build a CDX API URL with the given parameter dict."""
+    return f"{CDX_ENDPOINT}?{urlencode(params)}"
 
 
-def get_total_pages(target: str, params: dict) -> int:
+# ---------------------------------------------------------------------------
+# Scope helpers  — the core of the fix
+# ---------------------------------------------------------------------------
+
+def is_subdomain_target(domain: str) -> bool:
+    """
+    Return True if `domain` is itself a subdomain (e.g. api.example.com),
+    False if it is a root/eTLD+1 domain (e.g. example.com).
+
+    A root domain has exactly one dot separating label from public suffix.
+    We use a simple heuristic: split by '.' and count labels.
+    Two labels  -> root domain   (example.com)
+    Three+      -> subdomain     (api.example.com, sub.api.example.com)
+    """
+    parts = domain.lower().strip().split(".")
+    return len(parts) > 2
+
+
+def filter_by_scope(urls: set, target: str, include_subs: bool) -> set:
+    """
+    Strict hostname-level post-filter — applied after every CDX fetch to
+    guarantee that CDX scope leakage (SURT key expansion) never pollutes output.
+
+    Rules:
+      include_subs=True  -> keep URLs where hostname == target
+                            OR hostname ends with ".<target>"
+                            (i.e. direct subdomains of target only)
+      include_subs=False -> keep URLs where hostname == target exactly
+
+    This means:
+      target=api.example.com, include_subs=True  -> api.example.com + *.api.example.com
+      target=api.example.com, include_subs=False -> api.example.com only
+      target=example.com,     include_subs=True  -> example.com + *.example.com
+      target=example.com,     include_subs=False -> example.com only
+    """
+    target_lower = target.lower().strip()
+    sub_suffix = f".{target_lower}"
+    scoped = set()
+
+    for url in urls:
+        try:
+            hostname = urlparse(url).hostname
+            if not hostname:
+                continue
+            hostname = hostname.lower()
+
+            if hostname == target_lower:
+                scoped.add(url)
+            elif include_subs and hostname.endswith(sub_suffix):
+                scoped.add(url)
+        except Exception:
+            continue
+
+    return scoped
+
+
+# ---------------------------------------------------------------------------
+# CDX query builders — correct matchType per target type
+# ---------------------------------------------------------------------------
+
+def _cdx_params_for_target(domain: str, include_subs: bool) -> dict:
+    """
+    Build the correct CDX `url` + `matchType` parameters for a given target.
+
+    The CDX API's `matchType=domain` is designed for root domains and can
+    produce SURT key collisions when applied to subdomains, causing scope
+    leakage back to the parent domain.
+
+    Safe strategy:
+      - Root domain  + include_subs  -> url=*.domain/*,       matchType=domain
+      - Root domain  + no subs       -> url=domain/*,         matchType=prefix
+      - Subdomain    + include_subs  -> url=*.subdomain/*,    matchType=prefix
+                                        (no matchType=domain — avoids leakage)
+      - Subdomain    + no subs       -> url=subdomain/*,      matchType=prefix
+
+    The post-filter in filter_by_scope() is the final guarantee regardless.
+    """
+    is_sub = is_subdomain_target(domain)
+
+    if not is_sub and include_subs:
+        return {
+            "url": f"*.{domain}/*",
+            "matchType": "domain",
+        }
+    elif not is_sub and not include_subs:
+        return {
+            "url": f"{domain}/*",
+            "matchType": "prefix",
+        }
+    elif is_sub and include_subs:
+        # Use prefix match on the wildcard pattern — avoids domain-level expansion
+        return {
+            "url": f"*.{domain}/*",
+            "matchType": "prefix",
+        }
+    else:  # is_sub and not include_subs
+        return {
+            "url": f"{domain}/*",
+            "matchType": "prefix",
+        }
+
+
+# ---------------------------------------------------------------------------
+# CDX pagination helpers
+# ---------------------------------------------------------------------------
+
+def get_total_pages(params: dict) -> int:
     """
     Technique from waymore: query showNumPages=true to get total page count
     before spawning concurrent page fetches.
@@ -89,8 +208,8 @@ def get_total_pages(target: str, params: dict) -> int:
     check_params.pop("page", None)
     check_params.pop("output", None)
 
-    url = build_cdx_url(target, check_params)
-    _log(f"[INFO] Fetching page count from CDX API...")
+    url = build_cdx_url(check_params)
+    _log("[INFO] Fetching page count from CDX API...")
     response = make_request(url)
 
     try:
@@ -100,22 +219,19 @@ def get_total_pages(target: str, params: dict) -> int:
         return 1
 
 
-def fetch_page(target: str, params: dict, page: int) -> set:
-    """
-    Fetch a single page from the CDX API.
-    Returns a set of URLs found on that page.
-    """
+def fetch_page(params: dict, page: int) -> set:
+    """Fetch a single CDX page and return a set of URLs."""
     page_params = dict(params)
     page_params["page"] = str(page)
-    url = build_cdx_url(target, page_params)
+    url = build_cdx_url(page_params)
     response = make_request(url)
     return parse_cdx_response(response)
 
 
-def fetch_with_resume_key(target: str, params: dict, limit: int = DEFAULT_LIMIT) -> set:
+def fetch_with_resume_key(params: dict, limit: int = DEFAULT_LIMIT) -> set:
     """
-    Technique from waybackpy: use showResumeKey + resumeKey for paginated fetching.
-    More reliable than page-based for very large result sets.
+    Technique from waybackpy: use showResumeKey + resumeKey cursor for
+    paginated fetching. More reliable than page-based for very large sets.
     """
     results = set()
     resume_key = None
@@ -132,7 +248,7 @@ def fetch_with_resume_key(target: str, params: dict, limit: int = DEFAULT_LIMIT)
         elif "resumeKey" in fetch_params:
             del fetch_params["resumeKey"]
 
-        url = build_cdx_url(target, fetch_params)
+        url = build_cdx_url(fetch_params)
         response = make_request(url)
 
         if not response or response.isspace():
@@ -141,17 +257,18 @@ def fetch_with_resume_key(target: str, params: dict, limit: int = DEFAULT_LIMIT)
         lines = response.strip().splitlines()
         more = False
 
-        if len(lines) >= 3:
-            second_last = lines[-2]
-            if len(second_last) == 0:
-                resume_key = lines[-1].strip()
-                response = "\n".join(lines[:-2])
-                more = True
+        if len(lines) >= 3 and len(lines[-2]) == 0:
+            resume_key = lines[-1].strip()
+            response = "\n".join(lines[:-2])
+            more = True
 
         page_results = parse_cdx_response(response)
         results.update(page_results)
         page_num += 1
-        _log(f"[INFO] Resume-key page {page_num}: {len(page_results)} URLs (total: {len(results)})")
+        _log(
+            f"[INFO] Resume-key page {page_num}: "
+            f"{len(page_results)} URLs (running total: {len(results)})"
+        )
 
         if not more:
             break
@@ -159,10 +276,14 @@ def fetch_with_resume_key(target: str, params: dict, limit: int = DEFAULT_LIMIT)
     return results
 
 
+# ---------------------------------------------------------------------------
+# CDX response parser
+# ---------------------------------------------------------------------------
+
 def parse_cdx_response(response: str) -> set:
     """
-    Parse CDX API response text into a set of original URLs.
-    Handles both plain text (one URL per line) and JSON formats.
+    Parse a CDX API response into a set of original URLs.
+    Handles both plain text (one URL per line) and JSON array formats.
     """
     urls = set()
     if not response or not response.strip():
@@ -175,9 +296,9 @@ def parse_cdx_response(response: str) -> set:
             data = json.loads(stripped)
             for row in data:
                 if isinstance(row, list) and len(row) >= 3:
-                    url = row[2]
-                    if url and url != "original" and url.startswith("http"):
-                        urls.add(normalize_url(url))
+                    candidate = row[2]
+                    if candidate and candidate != "original" and candidate.startswith("http"):
+                        urls.add(normalize_url(candidate))
                 elif isinstance(row, str) and row.startswith("http"):
                     urls.add(normalize_url(row))
             return urls
@@ -191,8 +312,7 @@ def parse_cdx_response(response: str) -> set:
         if line.startswith("http"):
             urls.add(normalize_url(line))
         else:
-            parts = line.split(" ")
-            for part in parts:
+            for part in line.split(" "):
                 if part.startswith("http"):
                     urls.add(normalize_url(part))
                     break
@@ -202,30 +322,22 @@ def parse_cdx_response(response: str) -> set:
 
 def normalize_url(url: str) -> str:
     """
-    Normalize a URL: remove default ports (80, 443), strip trailing slash variations.
+    Normalize a URL: remove default ports (80/443), clean whitespace.
     Technique from waymore's linksFoundAdd().
     """
     try:
         parsed = urlparse(url.strip())
         netloc = parsed.netloc
-        if parsed.port == 80 or parsed.port == 443:
+        if parsed.port in (80, 443):
             netloc = parsed.hostname or netloc
         return parsed._replace(netloc=netloc).geturl()
     except Exception:
         return url
 
 
-def is_subdomain(url: str, domain: str) -> bool:
-    """
-    Check if a URL belongs to a subdomain (not the root domain).
-    From waybackurls' isSubdomain().
-    """
-    try:
-        parsed = urlparse(url)
-        return parsed.hostname.lower() != domain.lower()
-    except Exception:
-        return False
-
+# ---------------------------------------------------------------------------
+# Three fetch methods (waymore / waybackurls / waybackpy techniques)
+# ---------------------------------------------------------------------------
 
 def get_wayback_urls_pagination(
     domain: str,
@@ -236,19 +348,15 @@ def get_wayback_urls_pagination(
     threads: int = DEFAULT_THREADS,
 ) -> set:
     """
-    Main CDX fetcher using PAGE-BASED pagination (technique from waymore).
-    Spawns concurrent requests for all pages.
+    Method 1 — Page-based concurrent pagination (waymore technique).
+    Fetches total page count first, then requests all pages in parallel.
     """
-    results = set()
-
-    target = f"*.{domain}/*" if include_subs else f"{domain}/*"
-
+    base = _cdx_params_for_target(domain, include_subs)
     params = {
-        "url": target,
+        **base,
         "output": "text",
         "fl": "original",
         "collapse": "urlkey",
-        "matchType": "domain" if include_subs else "prefix",
     }
 
     if from_date:
@@ -259,19 +367,20 @@ def get_wayback_urls_pagination(
         for i, f in enumerate(filters):
             params[f"filter{i}"] = f
 
-    total_pages = get_total_pages(domain, params)
+    total_pages = get_total_pages(params)
     _log(f"[INFO] CDX page-based: {total_pages} page(s) to fetch")
 
+    results = set()
+
     if total_pages == 1:
-        url = build_cdx_url(domain, params)
-        response = make_request(url)
-        results.update(parse_cdx_response(response))
-        _log(f"[INFO] Page-based single request: {len(results)} URLs")
+        url = build_cdx_url(params)
+        results.update(parse_cdx_response(make_request(url)))
+        _log(f"[INFO] Page-based (single request): {len(results)} raw URLs")
         return results
 
     with ThreadPoolExecutor(max_workers=threads) as executor:
         futures = {
-            executor.submit(fetch_page, domain, params, page): page
+            executor.submit(fetch_page, params, page): page
             for page in range(total_pages)
         }
         for future in as_completed(futures):
@@ -279,7 +388,10 @@ def get_wayback_urls_pagination(
             try:
                 page_urls = future.result()
                 results.update(page_urls)
-                _log(f"[INFO] Page {page + 1}/{total_pages}: {len(page_urls)} URLs (total: {len(results)})")
+                _log(
+                    f"[INFO] Page {page + 1}/{total_pages}: "
+                    f"{len(page_urls)} URLs (running total: {len(results)})"
+                )
             except Exception as e:
                 _log(f"[WARN] Page {page} failed: {e}")
 
@@ -294,13 +406,12 @@ def get_wayback_urls_resumekey(
     to_date: str = None,
 ) -> set:
     """
-    Secondary CDX fetcher using RESUME KEY pagination (technique from waybackpy).
-    Catches any results missed by page-based pagination.
+    Method 2 — Resume-key cursor pagination (waybackpy technique).
+    Catches entries that page-based pagination may miss on large datasets.
     """
-    target = f"*.{domain}/*" if include_subs else f"{domain}/*"
-
+    base = _cdx_params_for_target(domain, include_subs)
     params = {
-        "url": target,
+        **base,
         "output": "text",
         "fl": "original",
         "collapse": "urlkey",
@@ -315,8 +426,8 @@ def get_wayback_urls_resumekey(
         for i, f in enumerate(filters):
             params[f"filter{i}"] = f
 
-    _log(f"[INFO] CDX resume-key pagination starting...")
-    return fetch_with_resume_key(domain, params)
+    _log("[INFO] CDX resume-key pagination starting...")
+    return fetch_with_resume_key(params)
 
 
 def get_wayback_urls_exact(
@@ -326,8 +437,8 @@ def get_wayback_urls_exact(
     to_date: str = None,
 ) -> set:
     """
-    Exact CDX query without subdomain wildcard (technique from waybackurls).
-    Uses collapse=urlkey and JSON output for robust parsing.
+    Method 3 — Exact domain prefix query with JSON output (waybackurls technique).
+    Uses collapse=urlkey and JSON parsing for additional coverage.
     """
     params = {
         "url": f"{domain}/*",
@@ -340,9 +451,8 @@ def get_wayback_urls_exact(
     if to_date:
         params["to"] = to_date
 
-    url = build_cdx_url(domain, params)
-    _log(f"[INFO] CDX exact domain query (no wildcard)...")
-    response = make_request(url)
+    _log("[INFO] CDX exact prefix query (waybackurls technique)...")
+    response = make_request(build_cdx_url(params))
 
     results = set()
     if not response or not response.strip():
@@ -356,29 +466,28 @@ def get_wayback_urls_exact(
                 skip_first = False
                 continue
             if isinstance(row, list) and len(row) >= 3:
-                url_val = row[2]
-                if url_val and url_val.startswith("http"):
-                    results.add(normalize_url(url_val))
+                candidate = row[2]
+                if candidate and candidate.startswith("http"):
+                    results.add(normalize_url(candidate))
     except (json.JSONDecodeError, TypeError):
         results.update(parse_cdx_response(response))
 
-    _log(f"[INFO] Exact query: {len(results)} URLs")
+    _log(f"[INFO] Exact prefix query: {len(results)} raw URLs")
     return results
 
 
+# ---------------------------------------------------------------------------
+# Versions mode (waybackurls --get-versions technique)
+# ---------------------------------------------------------------------------
+
 def get_wayback_versions(url_input: str) -> set:
     """
-    Get all archived versions of a specific URL (technique from waybackurls --get-versions).
-    Deduplicates by content digest (same content = same version).
+    Fetch all unique archived versions of a specific URL.
+    Deduplicates by content digest so identical captures are collapsed.
     """
-    params = {
-        "url": url_input,
-        "output": "json",
-    }
-
-    api_url = build_cdx_url(url_input, params)
+    params = {"url": url_input, "output": "json"}
     _log(f"[INFO] Fetching all archived versions of: {url_input}")
-    response = make_request(api_url)
+    response = make_request(build_cdx_url(params))
 
     versions = set()
     if not response or not response.strip():
@@ -386,52 +495,55 @@ def get_wayback_versions(url_input: str) -> set:
 
     try:
         data = json.loads(response.strip())
-        seen_digests = set()
+        seen_digests: set = set()
         skip_first = True
         for row in data:
             if skip_first:
                 skip_first = False
                 continue
             if isinstance(row, list) and len(row) >= 7:
-                timestamp = row[1]
-                original = row[2]
-                digest = row[5]
+                timestamp, original, digest = row[1], row[2], row[5]
                 if digest not in seen_digests:
                     seen_digests.add(digest)
-                    versions.add(f"https://web.archive.org/web/{timestamp}if_/{original}")
+                    versions.add(
+                        f"https://web.archive.org/web/{timestamp}if_/{original}"
+                    )
     except (json.JSONDecodeError, TypeError):
         pass
 
     return versions
 
 
+# ---------------------------------------------------------------------------
+# Misc helpers
+# ---------------------------------------------------------------------------
+
 def build_filters(status_code: str = None, mime_type: str = None) -> list:
-    """Build CDX filter strings from user arguments."""
+    """Build CDX filter strings from CLI arguments."""
     filters = []
     if status_code:
         filters.append(f"statuscode:{status_code}")
     if mime_type:
-        safe_mime = mime_type.replace("+", r"\+")
-        filters.append(f"mimetype:{safe_mime}")
+        filters.append(f"mimetype:{mime_type.replace('+', r'+')}")
     return filters
-
-
-def _log(msg: str) -> None:
-    """Print a log message to stderr so stdout stays clean for piping."""
-    print(msg, file=sys.stderr)
 
 
 def deduplicate(urls: set) -> list:
     """
-    Final deduplication pass: normalize and sort all collected URLs.
-    Removes duplicates that differ only in trailing slashes or port numbers.
+    Final dedup pass: strip trailing slashes uniformly and sort.
     """
-    normalized = set()
-    for url in urls:
-        clean = url.rstrip("/")
-        normalized.add(clean)
+    normalized = {url.rstrip("/") for url in urls}
     return sorted(normalized)
 
+
+def _log(msg: str) -> None:
+    """Write log messages to stderr so stdout stays clean for piping."""
+    print(msg, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Main harvest orchestrator
+# ---------------------------------------------------------------------------
 
 def harvest(
     domain: str,
@@ -444,30 +556,35 @@ def harvest(
     skip_resume_key: bool = False,
 ) -> list:
     """
-    Main harvest function combining all three techniques for maximum coverage.
+    Harvest archived URLs using all three complementary CDX methods, then
+    apply strict scope enforcement and deduplicate.
 
     Strategy:
-    1. Page-based pagination with wildcard + matchType=domain (waymore)
-    2. Resume-key pagination (waybackpy) — catches any missed entries
-    3. Exact domain query without wildcard (waybackurls) — additional coverage
-    4. Final in-memory deduplication
+      1. Page-based concurrent pagination          (waymore)
+      2. Resume-key cursor pagination              (waybackpy)
+      3. Exact prefix query with JSON output       (waybackurls)
+      4. Strict hostname post-filter               (scope enforcement)
+      5. Final deduplication + sort
     """
-    all_urls = set()
+    all_urls: set = set()
     filters = build_filters(filter_status, filter_mime)
+    is_sub = is_subdomain_target(domain)
 
     _log(f"\n[wayback-unified v{VERSION}]")
-    _log(f"[INFO] Target: {domain}")
-    _log(f"[INFO] Include subdomains: {include_subs}")
+    _log(f"[INFO] Target        : {domain}")
+    _log(f"[INFO] Is subdomain  : {is_sub}")
+    _log(f"[INFO] Include subs  : {include_subs}")
     if from_date:
-        _log(f"[INFO] Date from: {from_date}")
+        _log(f"[INFO] Date from     : {from_date}")
     if to_date:
-        _log(f"[INFO] Date to: {to_date}")
+        _log(f"[INFO] Date to       : {to_date}")
     if filters:
-        _log(f"[INFO] Filters: {filters}")
-    _log(f"[INFO] Threads: {threads}")
+        _log(f"[INFO] CDX filters   : {filters}")
+    _log(f"[INFO] Threads       : {threads}")
     _log("")
 
-    _log("[METHOD 1/3] Page-based pagination (waymore technique)...")
+    # --- Method 1 -----------------------------------------------------------
+    _log("[METHOD 1/3] Page-based concurrent pagination (waymore technique)...")
     try:
         page_urls = get_wayback_urls_pagination(
             domain,
@@ -478,12 +595,13 @@ def harvest(
             threads=threads,
         )
         all_urls.update(page_urls)
-        _log(f"[METHOD 1/3] Found: {len(page_urls)} URLs\n")
+        _log(f"[METHOD 1/3] Raw results: {len(page_urls)} URLs\n")
     except Exception as e:
         _log(f"[WARN] Method 1 failed: {e}\n")
 
+    # --- Method 2 -----------------------------------------------------------
     if not skip_resume_key:
-        _log("[METHOD 2/3] Resume-key pagination (waybackpy technique)...")
+        _log("[METHOD 2/3] Resume-key cursor pagination (waybackpy technique)...")
         try:
             resume_urls = get_wayback_urls_resumekey(
                 domain,
@@ -492,13 +610,17 @@ def harvest(
                 from_date=from_date,
                 to_date=to_date,
             )
-            new_urls = resume_urls - all_urls
+            new_count = len(resume_urls - all_urls)
             all_urls.update(resume_urls)
-            _log(f"[METHOD 2/3] Found: {len(resume_urls)} URLs ({len(new_urls)} new)\n")
+            _log(
+                f"[METHOD 2/3] Raw results: {len(resume_urls)} URLs "
+                f"({new_count} new)\n"
+            )
         except Exception as e:
             _log(f"[WARN] Method 2 failed: {e}\n")
 
-    _log("[METHOD 3/3] Exact domain query (waybackurls technique)...")
+    # --- Method 3 -----------------------------------------------------------
+    _log("[METHOD 3/3] Exact prefix query (waybackurls technique)...")
     try:
         exact_urls = get_wayback_urls_exact(
             domain,
@@ -506,103 +628,148 @@ def harvest(
             from_date=from_date,
             to_date=to_date,
         )
-        new_urls = exact_urls - all_urls
+        new_count = len(exact_urls - all_urls)
         all_urls.update(exact_urls)
-        _log(f"[METHOD 3/3] Found: {len(exact_urls)} URLs ({len(new_urls)} new)\n")
+        _log(
+            f"[METHOD 3/3] Raw results: {len(exact_urls)} URLs "
+            f"({new_count} new)\n"
+        )
     except Exception as e:
         _log(f"[WARN] Method 3 failed: {e}\n")
 
-    if not include_subs:
-        all_urls = {u for u in all_urls if not is_subdomain(u, domain)}
+    # --- Strict scope enforcement -------------------------------------------
+    # This is the definitive guard against CDX scope leakage.
+    # Regardless of what the CDX API returned, we only keep URLs whose
+    # hostname is exactly `domain` (or a direct subdomain of it if
+    # include_subs=True). This correctly handles both root domains and
+    # subdomain targets like api.example.com.
+    before_filter = len(all_urls)
+    all_urls = filter_by_scope(all_urls, domain, include_subs)
+    filtered_out = before_filter - len(all_urls)
+
+    if filtered_out > 0:
+        _log(
+            f"[SCOPE] Removed {filtered_out} out-of-scope URLs "
+            f"(CDX scope leakage corrected)"
+        )
 
     final = deduplicate(all_urls)
-    _log(f"[DONE] Total unique URLs after deduplication: {len(final)}")
+    _log(f"[DONE] Total unique in-scope URLs: {len(final)}")
     return final
 
 
-def main():
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="wayback-unified — Maximum coverage Wayback Machine URL harvester",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Root domain (all subdomains included by default)
   python wayback_unified.py -d example.com
-  python wayback_unified.py -d example.com --subs
+
+  # Specific subdomain — scoped strictly to api.example.com + *.api.example.com
+  python wayback_unified.py -d api.example.com
+
+  # Specific subdomain — only api.example.com, no sub-subdomains
+  python wayback_unified.py -d api.example.com --no-subs
+
+  # Date range filter
   python wayback_unified.py -d example.com --from 20200101 --to 20231231
+
+  # Only HTTP 200 responses
   python wayback_unified.py -d example.com --filter-status 200
+
+  # Only HTML pages
   python wayback_unified.py -d example.com --filter-mime text/html
-  python wayback_unified.py -d example.com -o output.txt --threads 10
-  python wayback_unified.py -d example.com --versions
+
+  # Save to file with more threads
+  python wayback_unified.py -d example.com -o results.txt --threads 10
+
+  # Pipe into other tools
+  python wayback_unified.py -d example.com | grep '\\.js$'
+  python wayback_unified.py -d example.com | httpx -silent
+
+  # Get all unique archived versions of a URL (deduped by content digest)
+  python wayback_unified.py --versions -d "https://example.com/login"
         """,
     )
 
     parser.add_argument(
         "-d", "--domain",
         required=True,
-        help="Target domain (e.g. example.com)"
+        help=(
+            "Target domain or subdomain (e.g. example.com or api.example.com). "
+            "Subdomain targets are scoped strictly to that subdomain."
+        ),
     )
     parser.add_argument(
         "--subs",
         action="store_true",
         default=True,
-        help="Include subdomains (default: True)"
+        help="Include sub-subdomains of the target (default: enabled)",
     )
     parser.add_argument(
         "--no-subs",
         action="store_true",
-        help="Exclude subdomains"
+        help="Restrict results to the exact target hostname only (no subdomains)",
     )
     parser.add_argument(
         "--from",
         dest="from_date",
         metavar="YYYYMMDD",
-        help="Start date for filtering (e.g. 20200101)"
+        help="Start date filter (e.g. 20200101)",
     )
     parser.add_argument(
         "--to",
         dest="to_date",
         metavar="YYYYMMDD",
-        help="End date for filtering (e.g. 20231231)"
+        help="End date filter (e.g. 20231231)",
     )
     parser.add_argument(
         "--filter-status",
         metavar="CODE",
-        help="Filter by HTTP status code (e.g. 200)"
+        help="Only return URLs archived with this HTTP status code (e.g. 200)",
     )
     parser.add_argument(
         "--filter-mime",
         metavar="TYPE",
-        help="Filter by MIME type (e.g. text/html)"
+        help="Only return URLs with this MIME type (e.g. text/html)",
     )
     parser.add_argument(
         "-o", "--output",
         metavar="FILE",
-        help="Output file (default: stdout)"
+        help="Write results to a file instead of stdout",
     )
     parser.add_argument(
         "-t", "--threads",
         type=int,
         default=DEFAULT_THREADS,
-        help=f"Number of concurrent threads (default: {DEFAULT_THREADS})"
+        help=f"Concurrent threads for page fetching (default: {DEFAULT_THREADS})",
     )
     parser.add_argument(
         "--skip-resume-key",
         action="store_true",
-        help="Skip the resume-key pagination method (faster but less coverage)"
+        help="Skip Method 2 (resume-key) — faster but slightly less coverage",
     )
     parser.add_argument(
         "--versions",
         action="store_true",
-        help="Fetch all archived versions of the input (use -d as the full URL)"
+        help=(
+            "Fetch all unique archived versions of a specific URL. "
+            "Pass the full URL via -d."
+        ),
     )
     parser.add_argument(
         "--version",
         action="version",
-        version=f"wayback-unified {VERSION}"
+        version=f"wayback-unified {VERSION}",
     )
 
     args = parser.parse_args()
-
     include_subs = not args.no_subs
 
     if args.versions:
